@@ -1,5 +1,7 @@
 name: Publish npm tool plugin
 on:
+  push:
+    branches: [feat/peter-dianshang-skill]
   workflow_dispatch:
     inputs:
       release:
@@ -53,7 +55,7 @@ jobs:
         env:
           RELEASE_VERSION: ${{ inputs.release }}
         run: |
-          node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; const p=JSON.parse(fs.readFileSync("package.json")); assert.equal(p.version,process.env.RELEASE_VERSION); assert.match(p.version,/^\d+\.\d+\.\d+$/);'
+          node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; const p=JSON.parse(fs.readFileSync("package.json")); if (process.env.RELEASE_VERSION) assert.equal(p.version,process.env.RELEASE_VERSION); assert.match(p.version,/^\d+\.\d+\.\d+$/);'
           mkdir packed-check
           tar -xzf candidate.tgz -C packed-check
           node --input-type=module -e 'import assert from "node:assert/strict"; const p=(await import("./packed-check/package/dist/index.js")).default; assert.equal(p.id,"petercjl.dongxuan-tools"); assert.equal(typeof p.setup,"function");'
@@ -63,6 +65,7 @@ jobs:
           path: candidate.tgz
           retention-days: 3
   publish:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     needs: qa
     runs-on: ubuntu-latest
     timeout-minutes: 10
