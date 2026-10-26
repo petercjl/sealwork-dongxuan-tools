@@ -25,3 +25,5 @@
 多 Skill 包通过 `skills: string[]` 声明完整集合，并为 source/status/install/update 提供显式 `--skill`。默认处理当前 Agent 下该包声明的全部 Skill；调用者可用 `skillName` 选定成员，再以 `targetDirectory` 指定该成员的精确目标。开始写入前核对所有成员的编辑与所有权状态及写入参数；完成回执逐个返回 Skill 同步和宿主源校验，仅全部通过才报告 complete。部分失败保留已完成成员，未知结果先核对再按包声明恢复。
 
 支持既有 `current`/`up_to_date` 和 runtimeEntry/runtime_entry 形式；新的 typed 合同要求身份、目标、所有权及 SHA-256 完整性证据一致。参数与副作用来自声明，缺少写入参数或不支持的合同返回具体差距与已知状态。包源码工作树不作为 npm 自动覆盖目标。
+
+切换到目标自带运行时后重新发现其合同；当全局已安装请求版本、目标运行时较旧时，使用已验证的全局来源执行剩余 Skill 同步，保留目标版本与来源版本的独立证据，不重复获取包或修改 Git 源码。

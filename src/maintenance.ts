@@ -38,6 +38,7 @@ function parseStatus(value: unknown) {
 const manifestSchema = z.object({ name: z.string(), version: z.string(), bin: z.union([z.string(), z.record(z.string(), z.string())]).optional() }).passthrough();
 type Snapshot = { input: Input; root: string; entry?: string; version: string; desired: string; target?: string; skillName?: string;
   machine?: MachineContract; multi?: boolean; members?: Snapshot[];
+  bootstrapContract?: { commands: Commands; machine?: MachineContract; fingerprint: string };
   commands?: Commands; skill?: z.infer<typeof statusSchema>; hostVerified?: boolean; complete: boolean;
   operations: string[][]; fallback?: string; backup?: string; fingerprint?: string; needsInspection?: boolean; released?: boolean;
   hostPending?: string; hostAttempts?: number; localFingerprint?: string; contractFingerprint?: string;
@@ -447,16 +448,22 @@ export class PackageMaintenance {
       ...(s.multi ? ["--skill", s.skillName!] : []),
       ...(s.commands[operation]?.options["--agent"]?.type === "string" ? ["--agent", "generic"] : []), "--json"];
   }
+  private async prepareMutation(s: Snapshot) {
+    if (s.version === s.desired || s.bootstrapVersion !== s.desired || !s.bootstrapEntry || !s.bootstrapContract) return;
+    const source = { ...s, entry: s.bootstrapEntry };
+    if (s.bootstrapContract.fingerprint !== await this.entryFingerprint(source)) throw new Error("The installed synchronization source changed after inspection; inspect again before mutation");
+    s.entry = s.bootstrapEntry; s.commands = s.bootstrapContract.commands; s.machine = s.bootstrapContract.machine;
+  }
   private mutationArgs(s: Snapshot) {
     if (!s.entry || !s.target || !s.commands) throw new Error("Lifecycle contract is incomplete");
     const operation = s.recovery ? (s.commands["update resume"] && s.recovery.operationId ? "update resume" : "update recover")
-      : s.version !== s.desired ? "update install" : s.skill?.installed ? "skill update" : "skill install";
+      : s.version !== s.desired && !(s.entry === s.bootstrapEntry && s.bootstrapVersion === s.desired) ? "update install" : s.skill?.installed ? "skill update" : "skill install";
     const contract = s.commands[operation];
     if (contract && !["write", "local-write"].includes(String(contract.sideEffects))) throw new Error(`${operation} must declare its write side effects`);
     if (!contract?.options["--json"] || !s.machine && operation.startsWith("update ") && !contract.options["--yes"]) {
       throw new Error(`The CLI does not advertise ${operation} with explicit target and structured output; missing --json or required confirmation declaration. Reuse the known contract; repair only this declaration or use its documented interface.`);
     }
-    if (s.version !== s.desired && s.input.version !== "latest" && !(contract.options["--version"]?.type === "string" && /^\d+\.\d+\.\d+$/.test(s.desired))) throw new Error("An explicit version/channel requires a documented version-selection contract for the updater.");
+    if (operation === "update install" && s.input.version !== "latest" && !(contract.options["--version"]?.type === "string" && /^\d+\.\d+\.\d+$/.test(s.desired))) throw new Error("An explicit version/channel requires a documented version-selection contract for the updater.");
     if (s.recovery && (operation === "update resume" && !contract.options["--operation"] || (s.recoveryAttempts ?? 0) >= 1)) throw new Error("Recovery requires its advertised operation binding; repeated failed recovery needs native diagnostics.");
     const args = this.commandArgs(s, operation);
     if (contract.options["--yes"]?.type === "boolean") args.push("--yes");
@@ -502,6 +509,7 @@ export class PackageMaintenance {
     s.bootstrapEntry = entry;
     if (!await this.loadContract(s, call)) { s.fallback = `No supported structured help or machine maintenance contract was found through --help, capabilities.json or capabilities --json. Read ${join(root, "UPDATE.md")} for the missing interface.`; return s; }
     s.contractFingerprint = await this.entryFingerprint(s);
+    s.bootstrapContract = { commands: s.commands!, machine: s.machine, fingerprint: s.contractFingerprint };
     const missing = [!s.machine && !s.commands!["version"] && "version", !s.commands!["skill source"] && "skill source",
       !s.commands!["skill status"] && "skill status", !targetBinding(s.commands!, s.machine, "skill status") && "skill status option --target-directory"].filter(Boolean);
     if (missing.length) {
@@ -545,15 +553,15 @@ export class PackageMaintenance {
     s.skill = await this.status(s, call);
     if (s.skill.installed && !s.skill.managed) { s.fallback = "Selected target is not package-managed; preserve the unrelated installation."; return s; }
     if (s.skill.edited?.length) { s.fallback = "Managed local edits exist. Preserve them through the package's documented conflict/backup operation before applying updates."; return s; }
-    await this.discoverEntry(s, call);
+    if (await this.discoverEntry(s, call)) await this.loadContract(s, call);
     s.version = await this.runtimeVersion(s, call);
-    if (s.version !== bootstrapVersion) return this.refreshLocal(s, call, s.version);
+    if (s.version !== bootstrapVersion) return this.refreshLocal(s, call, s.version, true);
     if (s.version === s.desired && s.skill.installed && s.skill.managed && s.skill.up_to_date && s.skill.runtime_verified !== false) {
       await this.verifyHost(s, call);
     }
     return s;
   }
-  private async refreshLocal(s: Snapshot, call: unknown, knownVersion?: string): Promise<Snapshot> {
+  private async refreshLocal(s: Snapshot, call: unknown, knownVersion?: string, contractLoaded = false): Promise<Snapshot> {
     if (s.members) {
       for (let i = 0; i < s.members.length; i++) {
         const member = s.members[i]!;
@@ -566,7 +574,7 @@ export class PackageMaintenance {
     const previousVersion = s.version, previousSync = s.skill?.up_to_date, recovering = s.needsInspection;
     let version = knownVersion;
     // The new runtime may have a changed lifecycle contract after replacement.
-    await this.loadContract(s, call);
+    if (!contractLoaded) await this.loadContract(s, call);
     s.skill = await this.status(s, call);
     if (await this.discoverEntry(s, call, recovering)) {
       await this.loadContract(s, call);
@@ -630,7 +638,7 @@ export class PackageMaintenance {
   private async apply(s: Snapshot, call: unknown): Promise<Snapshot> {
     if (s.members) {
       // Validate every remaining member before admitting any write.
-      for (const member of s.members) if (!member.complete && !member.hostPending) this.mutationArgs(member);
+      for (const member of s.members) if (!member.complete && !member.hostPending) { await this.prepareMutation(member); this.mutationArgs(member); }
       for (let i = 0; i < s.members.length; i++) {
         const member = s.members[i]!;
         if (member.complete) continue;
@@ -645,7 +653,7 @@ export class PackageMaintenance {
     }
     if (!s.entry || !s.target || !s.commands) throw new Error("Lifecycle contract is incomplete");
     let args: string[];
-    try { args = this.mutationArgs(s); }
+    try { await this.prepareMutation(s); args = this.mutationArgs(s); }
     catch (error) { s.fallback = error instanceof Error ? error.message : "Unsupported mutation contract"; return s; }
     if (s.recovery) s.recoveryAttempts = (s.recoveryAttempts ?? 0) + 1;
     const result = json(await this.run(args, call, s.operations));
