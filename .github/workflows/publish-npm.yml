@@ -1,0 +1,99 @@
+name: Publish npm tool plugin
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Exact committed package version
+        required: true
+        default: '0.1.0'
+        type: string
+      tag:
+        description: npm dist-tag
+        required: true
+        default: latest
+        type: choice
+        options: [latest, next]
+      verify_only:
+        description: Recover verification of an already published exact version without publishing again
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: npm-release-${{ github.repository }}
+  cancel-in-progress: false
+jobs:
+  qa:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.15.0'
+          package-manager-cache: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11.4.0'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.3'
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm typecheck
+      - run: pnpm pack --out candidate.tgz
+      - name: Verify requested version and packed runtime
+        env:
+          RELEASE_VERSION: ${{ inputs.release }}
+        run: |
+          node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; const p=JSON.parse(fs.readFileSync("package.json")); assert.equal(p.version,process.env.RELEASE_VERSION); assert.match(p.version,/^\d+\.\d+\.\d+$/);'
+          mkdir packed-check
+          tar -xzf candidate.tgz -C packed-check
+          node --input-type=module -e 'import assert from "node:assert/strict"; const p=(await import("./packed-check/package/dist/index.js")).default; assert.equal(p.id,"petercjl.dongxuan-tools"); assert.equal(typeof p.setup,"function");'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qa-${{ matrix.os }}
+          path: candidate.tgz
+          retention-days: 3
+  publish:
+    needs: qa
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RELEASE_VERSION: ${{ inputs.release }}
+      DIST_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.15.0'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm install --global npm@11.18.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: qa-ubuntu-latest
+      - name: Publish validated artifact using Trusted Publishing
+        if: ${{ !inputs.verify_only }}
+        run: npm publish candidate.tgz --provenance --access public --tag "$DIST_TAG"
+      - name: Verify exact registry version
+        run: node scripts/verify-publication.mjs
+      - name: Record GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "v$RELEASE_VERSION" >/dev/null 2>&1; then
+            gh release view "v$RELEASE_VERSION" --json url
+          else
+            gh release create "v$RELEASE_VERSION" candidate.tgz --target "$GITHUB_SHA" --title "v$RELEASE_VERSION" --notes "Validated npm tool plugin release. Canonical source provenance is recorded in this checkout."
+          fi

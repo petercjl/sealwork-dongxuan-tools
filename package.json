@@ -1,0 +1,37 @@
+{
+  "name": "@petercjl/sealwork-dongxuan-tools",
+  "version": "0.1.0",
+  "description": "Dongxuan native tools collection for sealwork",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "sealwork.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --outfile dist/index.js --target node --format esm",
+    "prepack": "bun run build && node scripts/check.mjs",
+    "check": "node scripts/check.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "zod": "^4.3.6",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "packageManager": "pnpm@11.4.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/petercjl/sealwork-dongxuan-tools.git"
+  }
+}

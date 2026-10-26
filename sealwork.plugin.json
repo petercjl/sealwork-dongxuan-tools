@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 1,
+  "id": "petercjl.dongxuan-tools",
+  "name": "东轩工具集",
+  "description": "东轩电商工具集合，当前提供 npm 包与配套 Skill 维护。",
+  "entry": "dist/index.js",
+  "tools": [
+    "package_maintenance"
+  ],
+  "capabilities": [
+    "native-tools",
+    "session-hooks",
+    "tool-wrapping"
+  ],
+  "platforms": [
+    "darwin",
+    "win32",
+    "linux"
+  ],
+  "autoUpdate": {
+    "channel": "latest",
+    "compatibility": "semver"
+  }
+}
