@@ -1,6 +1,6 @@
 {
   "name": "@petercjl/sealwork-dongxuan-tools",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Dongxuan native tools collection for sealwork",
   "type": "module",
   "license": "MIT",

@@ -17,3 +17,11 @@
 开发扩展：`src/index.ts` 负责组合模块，`src/package-maintenance.ts` 负责现有维护工具及会话策略。新增模块同时更新清单、注册与释放检查；模块加载失败时释放已注册资源。
 
 旧安装迁移：先准备新包，任务空闲时停止并移除旧包 `@petercjl/sealwork-package-maintenance`，再添加和启动本工具集。两者提供同名工具，宿主会拒绝同时安装；迁移保留包外的配置、Skill 与业务数据。旧包不会跨包名自动升级，新包后续沿用默认自动更新。
+
+## 包维护合同
+
+维护工具兼容已有 `{ok:true,commands}` 结构化帮助，并识别 `capabilities.json`、`capabilities --json` 或声明的 `--help --json` 中的 `commandContracts` 与 `maintenanceContract` v1。按类型映射读取 source/status 回执，按声明区分精确 Skill 目录、Skill 父目录和宿主根目录；字段、目标和完整性证明冲突时停止。普通文本帮助不代表包没有机器合同。
+
+多 Skill 包通过 `skills: string[]` 声明完整集合，并为 source/status/install/update 提供显式 `--skill`。默认处理当前 Agent 下该包声明的全部 Skill；调用者可用 `skillName` 选定成员，再以 `targetDirectory` 指定该成员的精确目标。开始写入前核对所有成员的编辑与所有权状态及写入参数；完成回执逐个返回 Skill 同步和宿主源校验，仅全部通过才报告 complete。部分失败保留已完成成员，未知结果先核对再按包声明恢复。
+
+支持既有 `current`/`up_to_date` 和 runtimeEntry/runtime_entry 形式；新的 typed 合同要求身份、目标、所有权及 SHA-256 完整性证据一致。参数与副作用来自声明，缺少写入参数或不支持的合同返回具体差距与已知状态。包源码工作树不作为 npm 自动覆盖目标。

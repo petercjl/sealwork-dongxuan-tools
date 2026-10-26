@@ -1,7 +1,8 @@
 import { z } from "zod";
 import { readFile, stat, realpath } from "node:fs/promises";
-import { isAbsolute, join, resolve, relative, dirname } from "node:path";
+import { isAbsolute, join, resolve, relative, dirname, basename } from "node:path";
 import { createHash } from "node:crypto";
+import { discoverContract, mappedReceipt, targetBinding, type MachineContract, type Commands } from "./contracts.js";
 
 export type MaintenanceTool = { name?: string; description: string; input?: unknown; options?: { codemode: boolean }; execute(input: unknown, call: unknown): Promise<unknown> };
 type Registration = { dispose(): Promise<void> };
@@ -12,6 +13,7 @@ const inputSchema = z.object({
   package: z.string().regex(/^(?:@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/),
   version: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9.+~^*-]*$/).default("latest"),
   targetDirectory: z.string().refine(isAbsolute, "Use an absolute full Skill target directory").optional(),
+  skillName: z.string().regex(/^[a-z0-9][a-z0-9-]*$/).optional(),
   reason: z.string().min(1).max(400).optional(),
   verification: z.object({
     skillName: z.string().regex(/^[a-z0-9][a-z0-9-]*$/),
@@ -20,8 +22,6 @@ const inputSchema = z.object({
   }).strict().optional(),
 }).strict();
 type Input = z.infer<typeof inputSchema>;
-const commandSchema = z.object({ options: z.record(z.string(), z.object({ type: z.string(), required: z.boolean().optional() }).passthrough()).default({}) }).passthrough();
-const helpSchema = z.object({ ok: z.literal(true), commands: z.record(z.string(), commandSchema) }).passthrough();
 const sourceSchema = z.object({ ok: z.literal(true), name: z.string().regex(/^[a-z0-9][a-z0-9-]*$/), source: z.string(), version: z.string().optional() }).passthrough();
 const statusSchema = z.object({ ok: z.literal(true), installed: z.boolean(), managed: z.boolean(), up_to_date: z.boolean().optional(),
   version: z.string().optional(), runtime_entry: z.string().optional(), runtime_verified: z.boolean().optional(), edited: z.array(z.string()).optional(),
@@ -37,12 +37,13 @@ function parseStatus(value: unknown) {
 }
 const manifestSchema = z.object({ name: z.string(), version: z.string(), bin: z.union([z.string(), z.record(z.string(), z.string())]).optional() }).passthrough();
 type Snapshot = { input: Input; root: string; entry?: string; version: string; desired: string; target?: string; skillName?: string;
-  commands?: z.infer<typeof helpSchema>["commands"]; skill?: z.infer<typeof statusSchema>; hostVerified?: boolean; complete: boolean;
+  machine?: MachineContract; multi?: boolean; members?: Snapshot[];
+  commands?: Commands; skill?: z.infer<typeof statusSchema>; hostVerified?: boolean; complete: boolean;
   operations: string[][]; fallback?: string; backup?: string; fingerprint?: string; needsInspection?: boolean; released?: boolean;
   hostPending?: string; hostAttempts?: number; localFingerprint?: string; contractFingerprint?: string;
   verification?: Input["verification"]; bootstrapEntry?: string; bootstrapVersion?: string;
   failure?: { error: string; fingerprint: string; documents: string[]; observed: Set<string> };
-  lastOperation?: Record<string, unknown>; recovery?: { operationId: string; stage: string }; recoveryAttempts?: number };
+  lastOperation?: Record<string, unknown>; recovery?: { operationId?: string; stage: string }; recoveryAttempts?: number };
 
 export function maintenanceText(value: unknown): string {
   if (typeof value === "string") return value;
@@ -56,10 +57,6 @@ function object(value: unknown): value is Record<string, unknown> { return typeo
 function json(text: string): unknown {
   // Native Shell can append execution metadata; never scrape arbitrary embedded JSON.
   return JSON.parse(text.replace(/\s*<shell_metadata>[\s\S]*?<\/shell_metadata>\s*$/, "").trim());
-}
-function structuredHelp(text: string) {
-  try { return helpSchema.safeParse(json(text)); }
-  catch (error) { if (error instanceof SyntaxError) return undefined; throw error; }
 }
 export function maintenanceCommand(args: string[], platform = process.platform): string {
   const quote = (s: string) => platform === "win32" ? `'${s.replaceAll("'", "''")}'` : `'${s.replaceAll("'", "'\\''")}'`;
@@ -111,6 +108,8 @@ export class PackageMaintenance {
     // They identify the same admitted task; a new user prompt resets this state.
     if (current?.input.package === input.package) {
       if (object(raw) && raw.version === undefined) input = { ...input, version: current.input.version };
+      if (object(raw) && raw.skillName === undefined) input = { ...input, skillName: current.input.skillName };
+      if (object(raw) && raw.targetDirectory === undefined) input = { ...input, targetDirectory: current.input.targetDirectory };
       if (current.input.version === "latest" && input.version === current.desired) input = { ...input, version: current.input.version };
       if (input.action === "verify" && input.verification) {
         const target = current.input.targetDirectory ?? current.target ?? join(this.ownDirectory, input.verification.skillName);
@@ -125,7 +124,7 @@ export class PackageMaintenance {
       if (!current.input.targetDirectory && input.targetDirectory === current.target) input = { ...input, targetDirectory: undefined };
     }
     if (current && (current.input.package !== input.package || current.input.version !== input.version
-      || current.input.targetDirectory !== input.targetDirectory)) current = undefined;
+      || current.input.targetDirectory !== input.targetDirectory || current.input.skillName !== input.skillName)) current = undefined;
     if (input.action === "handoff") {
       if (!current || !input.reason) throw new Error("Inspect first and state the additional user-requested work or unsupported contract requiring ordinary tools.");
       if (this.verificationBindings(current).length) {
@@ -203,8 +202,11 @@ export class PackageMaintenance {
         : "Use action=apply to complete the remaining stages." };
   }
   private evidence(s: Snapshot) {
-    const names = ["version", "skill source", "skill status", "skill install", "skill update", "update install", "update operation", "update resume"];
-    return { entry: s.entry, bootstrapEntry: s.bootstrapEntry, bootstrapVersion: s.bootstrapVersion,
+    const names = ["version", "skill source", "skill status", "skill install", "skill update", "update install", "update operation", "update resume", "update recover"];
+    return { skills: s.members?.map(item => ({ name: item.skillName, target: item.target, entry: item.entry, current: item.version,
+        desired: item.desired, complete: item.complete, skillVerified: item.skill?.up_to_date === true && item.skill.managed,
+        hostVerified: item.hostVerified === true, fallback: item.fallback, hostPending: item.hostPending })),
+      entry: s.entry, bootstrapEntry: s.bootstrapEntry, bootstrapVersion: s.bootstrapVersion,
       lastOperation: s.lastOperation, recovery: s.recovery,
       registry: { selector: `${s.input.package}@${s.input.version}`, version: s.desired, verifiedBy: "npm view" },
       lifecycle: s.commands && !s.complete && (s.fallback || s.released) ? Object.fromEntries(names.filter(name => s.commands![name]).map(name => {
@@ -250,26 +252,35 @@ export class PackageMaintenance {
   }
   private async status(s: Snapshot, call: unknown) {
     if (!s.entry || !s.target) throw new Error("Selected runtime/target is unknown");
-    const status = parseStatus(json(await this.run(["node", s.entry, "skill", "status", "--target-directory", s.target, "--json"], call, s.operations)));
+    const raw = json(await this.run(this.commandArgs(s, "skill status"), call, s.operations));
+    const status = parseStatus(s.machine ? mappedReceipt(raw, s.machine, "status") : raw);
+    if (s.machine && status.name !== s.skillName) throw new Error("Status Skill identity differs from selected member");
     if (status.target !== undefined && (typeof status.target !== "string" || !await sameTarget(status.target, s.target))) throw new Error("Status target differs from the selected Skill");
     if (status.package !== undefined && status.package !== s.input.package) throw new Error("Status package identity differs from request");
     return status;
   }
   private async runtimeVersion(s: Snapshot, call: unknown) {
+    const raw = json(await this.run(s.machine && !s.commands?.version ? this.sourceArgs(s) : ["node", s.entry!, "version", "--json"], call, s.operations));
     const result = z.object({ ok: z.literal(true), version: z.string(), name: z.string().optional(), package: z.string().optional() }).passthrough().parse(
-      json(await this.run(["node", s.entry!, "version", "--json"], call, s.operations)));
-    if ((result.package ?? result.name) !== undefined && (result.package ?? result.name) !== s.input.package) throw new Error("Runtime package identity differs from request");
+      s.machine && !s.commands?.version ? mappedReceipt(raw, s.machine, "source") : raw);
+    if ((result.package ?? (s.machine ? undefined : result.name)) !== undefined && (result.package ?? result.name) !== s.input.package) throw new Error("Runtime package identity differs from request");
+    if (s.machine && !s.commands?.version && result.name !== s.skillName) throw new Error("Runtime source Skill identity differs from selected member");
     return result.version;
   }
   /** A bootstrap may be older than a successfully updated independent target.
    * Ask the advertised read-only operation API for its returned entry; never
    * infer a private runtime directory or reinstall to discover it. */
   private async discoverEntry(s: Snapshot, call: unknown, recovering = false) {
+    if (s.machine && object(s.skill?.recovery) && s.skill.recovery.required === true) {
+      const command = s.commands?.["update recover"];
+      if (command && targetBinding(s.commands!, s.machine, "update recover")) s.recovery = { stage: typeof s.skill.recovery.stage === "string" ? s.skill.recovery.stage : "required" };
+      else s.fallback = "The selected target reports recovery required but no supported update recover command is declared; preserve this receipt and resolve only recovery.";
+    }
     if (s.skill?.runtime_entry) return this.selectEntry(s, s.skill.runtime_entry, call);
     const contract = s.commands?.["update operation"];
-    if (!s.skill?.managed || (!recovering && s.skill.up_to_date) || !contract?.options["--target-directory"]
-      || !contract.options["--json"] || !["none", "read"].includes(String(contract.sideEffects))) return false;
-    const value = json(await this.run(["node", s.entry!, "update", "operation", "--target-directory", s.target!, "--json"], call, s.operations));
+    if (!s.skill?.managed || (!recovering && s.skill.up_to_date) || !s.commands || !targetBinding(s.commands, s.machine, "update operation")
+      || !contract?.options["--json"] || !["none", "read"].includes(String(contract.sideEffects))) return false;
+    const value = json(await this.run(this.commandArgs(s, "update operation"), call, s.operations));
     if (!object(value) || value.ok !== true) return false;
     if (value.package !== s.input.package || typeof value.target !== "string" || !await sameTarget(value.target, s.target!)) throw new Error("Operation receipt does not belong to the selected package/target");
     s.lastOperation = this.operationReceipt(value);
@@ -283,8 +294,9 @@ export class PackageMaintenance {
   private summaryFromFailure() {
     return "Update blocked with no verified progress. Report current/desired and the retained failure; installation documents may resolve a documented recovery. Repeating Shell writes, source repair, and OS permission changes are outside this recovery. inspect admits only changed installation contents or advertised operation recovery.";
   }
-  private async failureFingerprint(s: Snapshot) {
-    const paths = [s.entry, join(s.root, "package.json"), s.target && join(s.target, "SKILL.md"), s.target && join(s.target, "package.json")];
+  private async failureFingerprint(s: Snapshot): Promise<string> {
+    if (s.members) return JSON.stringify(await Promise.all(s.members.map(member => this.failureFingerprint(member))));
+    const paths = [s.entry, join(s.root, "package.json"), join(s.root, "capabilities.json"), s.target && join(s.target, "SKILL.md"), s.target && join(s.target, "package.json")];
     return JSON.stringify(await Promise.all(paths.map(async file => {
       if (!file) return null;
       const info = await stat(file).catch(() => undefined);
@@ -321,7 +333,7 @@ export class PackageMaintenance {
   }
   releaseDiagnostic(sessionID: string, key: string) { this.snapshots.get(sessionID)?.failure?.observed.delete(key); }
   private async entryFingerprint(s: Snapshot) {
-    return JSON.stringify(await Promise.all([s.entry, join(s.root, "package.json")].map(async path => {
+    return JSON.stringify(await Promise.all([s.entry, join(s.root, "package.json"), join(s.root, "capabilities.json")].map(async path => {
       const info = path ? await stat(path).catch(() => undefined) : undefined;
       return [path, info?.size, info?.mtimeMs, info?.ino];
     })));
@@ -332,7 +344,7 @@ export class PackageMaintenance {
   private async verifyFallback(s: Snapshot, binding: Input["verification"], call: unknown) {
     if (!binding || !s.entry) throw new Error("Provide skillName, targetOption and targetKind from the CLI's documented status contract.");
     if (s.contractFingerprint !== await this.entryFingerprint(s)) {
-      s.commands = helpSchema.parse(json(await this.run(["node", s.entry, "--help"], call, s.operations))).commands;
+      await this.loadContract(s, call);
       s.contractFingerprint = await this.entryFingerprint(s);
     }
     const contract = s.commands?.["skill status"];
@@ -351,7 +363,7 @@ export class PackageMaintenance {
     let status = parseStatus(receipt);
     s.skill = status; s.target = target; s.skillName = binding.skillName;
     if (status.installed && status.managed && !status.edited?.length && await this.discoverEntry(s, call)) {
-      s.commands = helpSchema.parse(json(await this.run(["node", s.entry, "--help"], call, s.operations))).commands;
+      await this.loadContract(s, call);
       const refreshed = json(await this.run(["node", s.entry, "skill", "status", binding.targetOption,
         binding.targetKind === "parent" ? dirname(target) : target, "--json"], call, s.operations));
       if (!object(refreshed) || refreshed.target !== target || refreshed.package !== undefined && refreshed.package !== s.input.package) throw new Error("Selected runtime status identity differs from the admitted target");
@@ -388,6 +400,84 @@ export class PackageMaintenance {
     if (!info.isFile() || info.size > 1_000_000) throw new Error("Package metadata is not a bounded file");
     return readFile(path, "utf8");
   }
+  private async loadContract(s: Snapshot, call: unknown) {
+    if (!s.entry) throw new Error("CLI entry is unknown");
+    let raw: unknown;
+    const help = await this.run(["node", s.entry, "--help"], call, s.operations);
+    try { raw = json(help); } catch { raw = undefined; }
+    let found = discoverContract(raw);
+    if (!found?.commands["skill source"] || !found.commands["skill status"]) {
+      found = undefined;
+      // Static machine declarations are bounded package data; loading them never executes source code.
+      let directory = dirname(await realpath(s.entry));
+      for (let depth = 0; depth < 12; depth++) {
+        const manifest = join(directory, "package.json");
+        if (await stat(manifest).catch(() => undefined)) {
+          const owner = manifestSchema.parse(json(await this.read(manifest, call)));
+          if (owner.name !== s.input.package) throw new Error("Machine contract belongs to a different package");
+          const file = join(directory, "capabilities.json");
+          if (await stat(file).catch(() => undefined)) found = discoverContract(json(await this.read(file, call)));
+          break;
+        }
+        const parent = dirname(directory); if (parent === directory) break; directory = parent;
+      }
+      if (!found && /\bcapabilities\b/.test(help)) {
+        found = discoverContract(json(await this.run(["node", s.entry, "capabilities", "--json"], call, s.operations)));
+      }
+    }
+    if (!found && /--help[^\n]*--json/.test(help)) found = discoverContract(json(await this.run(["node", s.entry, "--help", "--json"], call, s.operations)));
+    if (!found) return false;
+    s.commands = found.commands; s.machine = found.machine;
+    return true;
+  }
+  private sourceArgs(s: Snapshot) {
+    if (s.machine && !["none", "read"].includes(String(s.commands?.["skill source"]?.sideEffects))) throw new Error("Skill source must advertise a read-only contract");
+    return ["node", s.entry!, "skill", "source", ...(s.multi ? ["--skill", s.skillName!] : []), "--json"];
+  }
+  private commandArgs(s: Snapshot, operation: string) {
+    if (!s.entry || !s.target || !s.commands) throw new Error("Lifecycle target/commands are unknown");
+    if (["skill status", "update operation"].includes(operation) && !["none", "read"].includes(String(s.commands[operation]?.sideEffects))) throw new Error(`${operation} must advertise a read-only contract`);
+    const binding = targetBinding(s.commands, s.machine, operation);
+    if (!binding) throw new Error(`Unsupported automatic contract: ${operation} has no declared exact/parent target option`);
+    if (s.multi && s.commands[operation]?.options["--skill"]?.type !== "string") throw new Error(`${operation} must declare named Skill selection for a collection`);
+    if (binding.parent && basename(s.target) !== s.skillName) throw new Error("Parent target semantics cannot represent the selected custom Skill directory");
+    const hostRoot = "hostRoot" in binding && binding.hostRoot;
+    if (hostRoot && (basename(dirname(s.target)) !== "skills" || basename(s.target) !== s.skillName)) throw new Error("Host-root semantics cannot represent the selected Skill directory");
+    return ["node", s.entry, ...operation.split(" "), binding.flag, hostRoot ? dirname(dirname(s.target)) : binding.parent ? dirname(s.target) : s.target,
+      ...(s.multi ? ["--skill", s.skillName!] : []),
+      ...(s.commands[operation]?.options["--agent"]?.type === "string" ? ["--agent", "generic"] : []), "--json"];
+  }
+  private mutationArgs(s: Snapshot) {
+    if (!s.entry || !s.target || !s.commands) throw new Error("Lifecycle contract is incomplete");
+    const operation = s.recovery ? (s.commands["update resume"] && s.recovery.operationId ? "update resume" : "update recover")
+      : s.version !== s.desired ? "update install" : s.skill?.installed ? "skill update" : "skill install";
+    const contract = s.commands[operation];
+    if (contract && !["write", "local-write"].includes(String(contract.sideEffects))) throw new Error(`${operation} must declare its write side effects`);
+    if (!contract?.options["--json"] || !s.machine && operation.startsWith("update ") && !contract.options["--yes"]) {
+      throw new Error(`The CLI does not advertise ${operation} with explicit target and structured output; missing --json or required confirmation declaration. Reuse the known contract; repair only this declaration or use its documented interface.`);
+    }
+    if (s.version !== s.desired && s.input.version !== "latest" && !(contract.options["--version"]?.type === "string" && /^\d+\.\d+\.\d+$/.test(s.desired))) throw new Error("An explicit version/channel requires a documented version-selection contract for the updater.");
+    if (s.recovery && (operation === "update resume" && !contract.options["--operation"] || (s.recoveryAttempts ?? 0) >= 1)) throw new Error("Recovery requires its advertised operation binding; repeated failed recovery needs native diagnostics.");
+    const args = this.commandArgs(s, operation);
+    if (contract.options["--yes"]?.type === "boolean") args.push("--yes");
+    if (s.recovery && operation === "update resume") args.push("--operation", z.string().parse(s.recovery.operationId));
+    else if (operation === "update install" && contract.options["--version"]?.type === "string") args.push("--version", s.desired);
+    const bound = new Set(args.filter(arg => arg.startsWith("--")));
+    for (const [flag, option] of Object.entries(contract.options)) if (option.required && !bound.has(flag)) throw new Error(`Missing required advertised ${operation} option ${flag}; caller must resolve it before mutation`);
+    return args;
+  }
+  private aggregate(s: Snapshot) {
+    if (!s.members) return;
+    const members = s.members;
+    s.version = new Set(members.map(member => member.version)).size === 1 ? members[0]!.version : "mixed";
+    s.complete = members.every(member => member.complete);
+    s.hostVerified = members.every(member => member.hostVerified === true);
+    s.skill = { ok: true, installed: members.every(member => member.skill?.installed), managed: members.every(member => member.skill?.managed), up_to_date: members.every(member => member.skill?.up_to_date === true), edited: members.flatMap(member => member.skill?.edited ?? []) };
+    s.fallback = members.filter(member => member.fallback).map(member => `${member.skillName}: ${member.fallback}`).join("; ") || undefined;
+    s.hostPending = members.filter(member => member.hostPending).map(member => `${member.skillName}: ${member.hostPending}`).join("; ") || undefined;
+    s.recovery = members.find(member => member.recovery)?.recovery;
+    if (s.complete) { s.failure = undefined; s.needsInspection = false; }
+  }
   private async inspect(input: Input, call: unknown, operations: string[][] = []): Promise<Snapshot> {
     const [globalRoot, desiredValue] = await Promise.all([
       this.run(["npm", "root", "-g"], call, operations),
@@ -410,40 +500,76 @@ export class PackageMaintenance {
     if (!under(root, entry)) throw new Error("CLI entry escapes its package");
     s.entry = entry;
     s.bootstrapEntry = entry;
-    const help = structuredHelp(await this.run(["node", entry, "--help"], call, operations));
-    if (!help?.success) { s.fallback = `CLI has no supported structured help. Read ${join(root, "UPDATE.md")} or its documented lifecycle interface.`; return s; }
-    s.commands = help.data.commands;
+    if (!await this.loadContract(s, call)) { s.fallback = `No supported structured help or machine maintenance contract was found through --help, capabilities.json or capabilities --json. Read ${join(root, "UPDATE.md")} for the missing interface.`; return s; }
     s.contractFingerprint = await this.entryFingerprint(s);
-    const missing = [!s.commands["version"] && "version", !s.commands["skill source"] && "skill source",
-      !s.commands["skill status"] && "skill status", !s.commands["skill status"]?.options["--target-directory"] && "skill status option --target-directory"].filter(Boolean);
+    const missing = [!s.machine && !s.commands!["version"] && "version", !s.commands!["skill source"] && "skill source",
+      !s.commands!["skill status"] && "skill status", !targetBinding(s.commands!, s.machine, "skill status") && "skill status option --target-directory"].filter(Boolean);
     if (missing.length) {
       s.fallback = `Unsupported automatic contract: missing ${missing.join(", ")}. Reuse the supplied entry, registry version and help. Resolve the documented target binding, then use action=verify for read-only completion.`; return s;
     }
-    const sourceResult = sourceSchema.safeParse(json(await this.run(["node", entry, "skill", "source", "--json"], call, operations)));
+    const rawSource = json(await this.run(this.sourceArgs(s), call, operations));
+    const items = object(rawSource) && Array.isArray(rawSource.sources) ? rawSource.sources : undefined;
+    if (items && (items.length === 0 || items.length > 64 || object(rawSource) && rawSource.complete === false)) throw new Error("Source collection is empty, oversized or incomplete");
+    const sourceItems = s.machine && items ? items.map(item => sourceSchema.parse(mappedReceipt(item, s.machine!, "source"))) : undefined;
+    if (sourceItems?.some(item => item.package !== input.package)) throw new Error("Collection member package identity differs from request");
+    const sourceResult = sourceSchema.safeParse(sourceItems?.[0] ?? (s.machine ? mappedReceipt(rawSource, s.machine, "source") : rawSource));
     if (!sourceResult.success) { s.fallback = "skill source does not provide the required name/source identity. Reuse the known entry/help and resolve the Skill name, then use action=verify with the documented read-only status target binding."; return s; }
     const source = sourceResult.data;
-    s.skillName = source.name;
-    s.target = input.targetDirectory ? resolve(input.targetDirectory) : join(this.ownDirectory, source.name);
+    if (s.machine && source.package !== input.package) throw new Error("Source package identity differs from request");
+    const collection = sourceItems?.map(item => item.name) ?? (object(rawSource) ? rawSource.skills : undefined);
+    if (sourceItems && object(rawSource) && Array.isArray(rawSource.skills) && JSON.stringify([...rawSource.skills].sort()) !== JSON.stringify(sourceItems.map(item => item.name).sort())) throw new Error("Collection source identities conflict with its declared Skill names");
+    const names = z.array(z.string().regex(/^[a-z0-9][a-z0-9-]*$/)).max(64).parse(Array.isArray(collection) ? collection : [source.name]);
+    if (!names.length || new Set(names).size !== names.length) throw new Error("Skill collection must be nonempty and unique");
+    if (input.skillName && !names.includes(input.skillName)) throw new Error("Requested Skill is not in the advertised collection");
+    const selected = input.skillName ? [input.skillName] : names;
+    if (names.length > 1) {
+      if (!s.machine || !["skill source", "skill status"].every(operation => s.commands?.[operation]?.options["--skill"]?.type === "string")) {
+        s.fallback = "Multi-Skill packages must declare named --skill source/status selection before automatic maintenance."; return s;
+      }
+      if (input.targetDirectory && !input.skillName) { s.fallback = "An exact targetDirectory for a multi-Skill package requires skillName; omit it to use the current Agent's Skill directory for all members."; return s; }
+    }
+    const members: Snapshot[] = [];
+    for (const name of selected) {
+      const member: Snapshot = { ...s, skillName: name, multi: names.length > 1, target: input.targetDirectory ? resolve(input.targetDirectory) : join(this.ownDirectory, name) };
+      if (names.length > 1) {
+        const named = mappedReceipt(json(await this.run(this.sourceArgs(member), call, operations)), s.machine!, "source");
+        if (named.name !== name || named.package !== input.package) throw new Error("Named source identity differs from the advertised collection");
+      }
+      members.push(await this.inspectMember(member, call, manifest.version));
+    }
+    if (members.length === 1) return members[0]!;
+    s.members = members; s.skillName = undefined; s.target = undefined;
+    this.aggregate(s); s.localFingerprint = await this.fingerprint(s); s.fingerprint = s.localFingerprint; return s;
+  }
+  private async inspectMember(s: Snapshot, call: unknown, bootstrapVersion: string): Promise<Snapshot> {
     s.skill = await this.status(s, call);
     if (s.skill.installed && !s.skill.managed) { s.fallback = "Selected target is not package-managed; preserve the unrelated installation."; return s; }
     if (s.skill.edited?.length) { s.fallback = "Managed local edits exist. Preserve them through the package's documented conflict/backup operation before applying updates."; return s; }
     await this.discoverEntry(s, call);
     s.version = await this.runtimeVersion(s, call);
-    if (s.version !== manifest.version) return this.refreshLocal(s, call, s.version);
-    if (s.version === desired && s.skill.installed && s.skill.managed && s.skill.up_to_date && s.skill.runtime_verified !== false) {
+    if (s.version !== bootstrapVersion) return this.refreshLocal(s, call, s.version);
+    if (s.version === s.desired && s.skill.installed && s.skill.managed && s.skill.up_to_date && s.skill.runtime_verified !== false) {
       await this.verifyHost(s, call);
     }
     return s;
   }
   private async refreshLocal(s: Snapshot, call: unknown, knownVersion?: string): Promise<Snapshot> {
+    if (s.members) {
+      for (let i = 0; i < s.members.length; i++) {
+        const member = s.members[i]!;
+        if (member.complete && member.fingerprint === await this.fingerprint(member)) continue;
+        s.members[i] = await this.refreshLocal(member, call);
+      }
+      s.needsInspection = false; this.aggregate(s); s.localFingerprint = await this.fingerprint(s); s.fingerprint = s.localFingerprint; return s;
+    }
     if (!s.entry || !s.target) throw new Error("Selected runtime/target is unknown");
     const previousVersion = s.version, previousSync = s.skill?.up_to_date, recovering = s.needsInspection;
     let version = knownVersion;
     // The new runtime may have a changed lifecycle contract after replacement.
-    s.commands = helpSchema.parse(json(await this.run(["node", s.entry, "--help"], call, s.operations))).commands;
+    await this.loadContract(s, call);
     s.skill = await this.status(s, call);
     if (await this.discoverEntry(s, call, recovering)) {
-      s.commands = helpSchema.parse(json(await this.run(["node", s.entry, "--help"], call, s.operations))).commands;
+      await this.loadContract(s, call);
       s.skill = await this.status(s, call); version = undefined;
     }
     s.version = version ?? await this.runtimeVersion(s, call); s.needsInspection = false; s.hostPending = undefined; s.hostAttempts = 0;
@@ -461,6 +587,7 @@ export class PackageMaintenance {
     return s;
   }
   private async verifyHost(s: Snapshot, call: unknown) {
+    if (s.members) { for (const member of s.members) if (!member.complete && member.skill?.up_to_date) await this.verifyHost(member, call); this.aggregate(s); s.fingerprint = await this.fingerprint(s); return; }
     if (!s.target || !s.skillName) return;
     s.hostAttempts = (s.hostAttempts ?? 0) + 1;
     s.hostVerified = false; s.complete = false;
@@ -495,23 +622,31 @@ export class PackageMaintenance {
       if (s.hostAttempts >= 2) s.fallback = `Host verification failed twice; diagnose only registration/source loading. ${s.hostPending}`;
     }
   }
-  private async fingerprint(s: Snapshot) {
-    const paths = [s.entry, join(s.root, "package.json"), s.target ? join(s.target, "SKILL.md") : undefined, s.target ? join(s.target, "package.json") : undefined].filter((p): p is string => !!p);
+  private async fingerprint(s: Snapshot): Promise<string> {
+    if (s.members) return JSON.stringify(await Promise.all(s.members.map(member => this.fingerprint(member))));
+    const paths = [s.entry, join(s.root, "package.json"), join(s.root, "capabilities.json"), s.target ? join(s.target, "SKILL.md") : undefined, s.target ? join(s.target, "package.json") : undefined].filter((p): p is string => !!p);
     return JSON.stringify(await Promise.all(paths.map(async path => { const info = await stat(path).catch(() => undefined); return [path, info?.size, info?.mtimeMs, info?.ino]; })));
   }
   private async apply(s: Snapshot, call: unknown): Promise<Snapshot> {
-    if (!s.entry || !s.target || !s.commands) throw new Error("Lifecycle contract is incomplete");
-    const operation = s.recovery ? "update resume" : s.version !== s.desired ? "update install" : s.skill?.installed ? "skill update" : "skill install";
-    const contract = s.commands[operation];
-    if (!contract?.options["--target-directory"] || !contract.options["--json"] || (operation.startsWith("update ") && !contract.options["--yes"])) {
-      s.fallback = `The CLI does not advertise ${operation} with explicit target and structured output.`; return s;
+    if (s.members) {
+      // Validate every remaining member before admitting any write.
+      for (const member of s.members) if (!member.complete && !member.hostPending) this.mutationArgs(member);
+      for (let i = 0; i < s.members.length; i++) {
+        const member = s.members[i]!;
+        if (member.complete) continue;
+        if (member.hostPending) await this.verifyHost(member, call);
+        else {
+          try { s.members[i] = await this.apply(member, call); }
+          catch (error) { member.needsInspection = true; this.aggregate(s); throw error; }
+        }
+        if (s.members[i]!.fallback || s.members[i]!.hostPending) break;
+      }
+      this.aggregate(s); s.fingerprint = await this.fingerprint(s); return s;
     }
-    // Combined updaters often own a default channel. Explicit non-latest input
-    // cannot be silently replaced by that default.
-    if (s.version !== s.desired && s.input.version !== "latest" && !(contract.options["--version"]?.type === "string" && /^\d+\.\d+\.\d+$/.test(s.desired))) { s.fallback = "An explicit version/channel requires a documented version-selection contract for the updater."; return s; }
-    if (s.recovery && (!contract.options["--operation"] || (s.recoveryAttempts ?? 0) >= 1)) { s.fallback = "Recovery requires its advertised operation binding; repeated failed recovery needs native diagnostics."; return s; }
-    const args = ["node", s.entry, ...operation.split(" "), "--target-directory", s.target, ...(operation.startsWith("update ") ? ["--yes"] : []),
-      ...(s.recovery ? ["--operation", s.recovery.operationId] : operation === "update install" && contract.options["--version"]?.type === "string" ? ["--version", s.desired] : []), "--json"];
+    if (!s.entry || !s.target || !s.commands) throw new Error("Lifecycle contract is incomplete");
+    let args: string[];
+    try { args = this.mutationArgs(s); }
+    catch (error) { s.fallback = error instanceof Error ? error.message : "Unsupported mutation contract"; return s; }
     if (s.recovery) s.recoveryAttempts = (s.recoveryAttempts ?? 0) + 1;
     const result = json(await this.run(args, call, s.operations));
     s.lastOperation = this.operationReceipt(result);
@@ -519,12 +654,15 @@ export class PackageMaintenance {
     if (result.package !== undefined && result.package !== s.input.package || result.target !== undefined && (typeof result.target !== "string" || !await sameTarget(result.target, s.target))) throw new Error("Lifecycle receipt differs from selected package/target");
     if (typeof result.backup === "string") s.backup = result.backup;
     const changedEntry = await this.selectEntry(s, typeof result.entry === "string" ? result.entry : undefined, call);
-    if (changedEntry) s.commands = helpSchema.parse(json(await this.run(["node", s.entry, "--help"], call, s.operations))).commands;
+    if (changedEntry) await this.loadContract(s, call);
     // Reinspect only mutated local state; the requested registry version and
     // structured command contract remain the same evidence for this operation.
-    const status = await this.status(s, call);
+    let status = await this.status(s, call);
     s.skill = status;
-    if (status.runtime_entry) await this.selectEntry(s, status.runtime_entry, call);
+    if (status.runtime_entry && await this.selectEntry(s, status.runtime_entry, call)) {
+      await this.loadContract(s, call);
+      status = await this.status(s, call); s.skill = status;
+    }
     s.version = await this.runtimeVersion(s, call);
     s.recovery = undefined; s.released = false;
     if (s.version === s.desired && status.installed && status.managed && !status.edited?.length && status.up_to_date && status.runtime_verified !== false) await this.verifyHost(s, call);
