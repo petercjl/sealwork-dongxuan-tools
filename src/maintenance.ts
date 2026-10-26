@@ -568,6 +568,7 @@ export class PackageMaintenance {
         if (member.complete && member.fingerprint === await this.fingerprint(member)) continue;
         s.members[i] = await this.refreshLocal(member, call);
       }
+      if (s.failure && s.failure.fingerprint !== await this.failureFingerprint(s)) s.failure = undefined;
       s.needsInspection = false; this.aggregate(s); s.localFingerprint = await this.fingerprint(s); s.fingerprint = s.localFingerprint; return s;
     }
     if (!s.entry || !s.target) throw new Error("Selected runtime/target is unknown");
@@ -661,7 +662,11 @@ export class PackageMaintenance {
     if (!object(result) || result.ok !== true) throw new Error(JSON.stringify(this.operationReceipt(result) ?? { error: "Lifecycle operation failed; inspect its structured operation receipt" }));
     if (result.package !== undefined && result.package !== s.input.package || result.target !== undefined && (typeof result.target !== "string" || !await sameTarget(result.target, s.target))) throw new Error("Lifecycle receipt differs from selected package/target");
     if (typeof result.backup === "string") s.backup = result.backup;
-    const changedEntry = await this.selectEntry(s, typeof result.entry === "string" ? result.entry : undefined, call);
+    // In typed package envelopes entry describes the package-relative CLI layout;
+    // runtimeEntry is the returned owned installation. Legacy absolute entry receipts remain supported.
+    const candidate = typeof result.runtimeEntry === "string" ? result.runtimeEntry
+      : typeof result.entry === "string" && (!s.machine || isAbsolute(result.entry)) ? result.entry : undefined;
+    const changedEntry = await this.selectEntry(s, candidate, call);
     if (changedEntry) await this.loadContract(s, call);
     // Reinspect only mutated local state; the requested registry version and
     // structured command contract remain the same evidence for this operation.
